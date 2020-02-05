@@ -1,29 +1,68 @@
 package mr
 
-import "log"
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
+import (
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+	"time"
+)
 
+const defaultTimeoutInSeconds = 10 * time.Second
 
 type Master struct {
-	// Your definitions here.
-
+	mapManager    *TaskManager
+	reduceManager *TaskManager
+	nReduce       int
 }
 
-// Your code here -- RPC handlers for the worker to call.
+func (m *Master) FetchTask(args *FetchTaskArgs, reply *FetchTaskReply) error {
+	mapTask := m.mapManager.Trigger()
+	if mapTask != nil {
+		reply.TaskID = mapTask.ID
+		reply.Type = TaskTypeMap
+		reply.Input = mapTask.Input
+		reply.NReduce = m.nReduce
+		return nil
+	}
 
-//
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
+	// if mapTask is nil, start reduce
+	reduceTask := m.reduceManager.Trigger()
+	if reduceTask != nil {
+		reply.TaskID = reduceTask.ID
+		reply.Type = TaskTypeReduce
+		reply.Input = reduceTask.Input
+		reply.NReduce = m.nReduce
+		return nil
+	}
+
+	reply.Finished = true
 	return nil
 }
 
+func (m *Master) SubmitTask(args *SubmitTaskArgs, reply *SubmitTaskReply) error {
+	if args == nil {
+		return fmt.Errorf("args should not be nil")
+	}
+
+	if args.Type == TaskTypeMap {
+		if m.mapManager.Complete(args.TaskID) {
+			for idx, filepath := range args.Output {
+				if filepath != "" {
+					m.reduceManager.UpdateTaskInputsByID(idx, []string{filepath})
+				}
+			}
+		}
+	} else if args.Type == TaskTypeReduce {
+		m.reduceManager.Complete(args.TaskID)
+	} else {
+		fmt.Printf("Unsupport task type %v", args.Type)
+	}
+
+	return nil
+}
 
 //
 // start a thread that listens for RPCs from worker.go
@@ -45,12 +84,7 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	ret := false
-
-	// Your code here.
-
-
-	return ret
+	return m.reduceManager.Done()
 }
 
 //
@@ -58,10 +92,19 @@ func (m *Master) Done() bool {
 // main/mrmaster.go calls this function.
 //
 func MakeMaster(files []string, nReduce int) *Master {
-	m := Master{}
+	mapInputs := make([][]string, len(files))
+	for idx, file := range files {
+		mapInputs[idx] = []string{file}
+	}
+	mapManager := NewTaskManager(mapInputs, defaultTimeoutInSeconds)
+	reduceInputs := make([][]string, nReduce)
+	reduceManager := NewTaskManager(reduceInputs, defaultTimeoutInSeconds)
 
-	// Your code here.
-
+	m := Master{
+		mapManager:    mapManager,
+		reduceManager: reduceManager,
+		nReduce:       nReduce,
+	}
 
 	m.server()
 	return &m

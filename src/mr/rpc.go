@@ -6,18 +6,23 @@ package mr
 // remember to capitalize all names.
 //
 
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
-
-type ExampleArgs struct {
-	X int
-}
-
-type ExampleReply struct {
-	Y int
-}
-
 // Add your RPC definitions here.
+type FetchTaskArgs struct {
+}
 
+type FetchTaskReply struct {
+	TaskID   int
+	Input    []string
+	Type     TaskType
+	NReduce  int
+	Finished bool
+}
+
+type SubmitTaskArgs struct {
+	TaskID int
+	Type   TaskType
+	Output []string
+}
+
+type SubmitTaskReply struct {
+}

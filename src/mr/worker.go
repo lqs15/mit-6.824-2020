@@ -1,10 +1,20 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
+import (
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"math/rand"
+	"net/rpc"
+	"os"
+	"sort"
+	"time"
+)
 
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
 
 //
 // Map functions return a slice of KeyValue.
@@ -14,51 +24,142 @@ type KeyValue struct {
 	Value string
 }
 
-//
-// use ihash(key) % NReduce to choose the reduce
-// task number for each KeyValue emitted by Map.
-//
-func ihash(key string) int {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return int(h.Sum32() & 0x7fffffff)
-}
+// for sorting by key.
+type ByKey []KeyValue
 
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // main/mrworker.go calls this function.
 //
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
+	for {
+		reply := fetchTask()
+		if reply.Finished {
+			log.Println("Worker Finished.")
+			break
+		}
 
-	// Your worker implementation here.
+		if reply.Type == TaskTypeMap {
+			rPartitions := make([][]KeyValue, reply.NReduce)
+			for _, filename := range reply.Input {
+				file, err := os.Open(filename)
+				if err != nil {
+					log.Fatalf("cannot open %v", filename)
+				}
+				content, err := ioutil.ReadAll(file)
+				if err != nil {
+					log.Fatalf("cannot read %v", filename)
+				}
+				file.Close()
+				kva := mapf(filename, string(content))
+				for _, kv := range kva {
+					rIndex := ihash(kv.Key) % reply.NReduce
+					rPartitions[rIndex] = append(rPartitions[rIndex], kv)
+				}
+			}
 
-	// uncomment to send the Example RPC to the master.
-	// CallExample()
+			result := make([]string, reply.NReduce)
+			for idx, part := range rPartitions {
+				oname := fmt.Sprintf("mr-%d-%d", reply.TaskID, idx)
+				ofile, _ := os.Create(oname)
+				enc := json.NewEncoder(ofile)
+				for _, kv := range part {
+					err := enc.Encode(&kv)
+					if err != nil {
+						log.Fatalf("cannot write %v", oname)
+					}
+				}
+				ofile.Close()
+				result[idx] = oname
+			}
+
+			submitTask(reply.TaskID, reply.Type, result)
+		} else if reply.Type == TaskTypeReduce {
+			intermediate := []KeyValue{}
+			for _, filename := range reply.Input {
+				file, err := os.Open(filename)
+				if err != nil {
+					log.Fatalf("cannot open %v", filename)
+				}
+
+				var kva []KeyValue
+				dec := json.NewDecoder(file)
+				for {
+					var kv KeyValue
+					if err := dec.Decode(&kv); err != nil {
+						break
+					}
+					kva = append(kva, kv)
+				}
+				file.Close()
+				intermediate = append(intermediate, kva...)
+			}
+
+			sort.Sort(ByKey(intermediate))
+
+			//
+			// call Reduce on each distinct key in intermediate[],
+			// and print the result to mr-out-0.
+			//
+
+			// because there maybe multiple reduce task writing to the same file
+			// here we first create a tmp file, and rename to the final file
+			tmpname := fmt.Sprintf("mr-tmp-%s-%d", randomString(6), reply.TaskID)
+			oname := fmt.Sprintf("mr-out-%d", reply.TaskID)
+			ofile, _ := os.Create(tmpname)
+			i := 0
+			for i < len(intermediate) {
+				j := i + 1
+				for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+					j++
+				}
+				values := []string{}
+				for k := i; k < j; k++ {
+					values = append(values, intermediate[k].Value)
+				}
+				output := reducef(intermediate[i].Key, values)
+				// this is the correct format for each line of Reduce output.
+				fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+				i = j
+			}
+
+			ofile.Close()
+			if err := os.Rename(tmpname, oname); err != nil {
+				log.Fatalf("cannot rename %s to %s", tmpname, oname)
+			}
+			os.Remove(tmpname)
+
+			submitTask(reply.TaskID, reply.Type, []string{})
+		}
+
+		time.Sleep(1 * time.Second)
+	}
 
 }
 
-//
-// example function to show how to make an RPC call to the master.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
+func fetchTask() FetchTaskReply {
+	args := FetchTaskArgs{}
+	reply := FetchTaskReply{}
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+	call("Master.FetchTask", &args, &reply)
 
-	// fill in the argument(s).
-	args.X = 99
+	return reply
+}
 
-	// declare a reply structure.
-	reply := ExampleReply{}
+func submitTask(taskID int, taskType TaskType, result []string) {
+	args := SubmitTaskArgs{
+		TaskID: taskID,
+		Type:   taskType,
+		Output: result,
+	}
+	reply := SubmitTaskReply{}
 
-	// send the RPC request, wait for the reply.
-	call("Master.Example", &args, &reply)
-
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
+	call("Master.SubmitTask", &args, &reply)
 }
 
 //
